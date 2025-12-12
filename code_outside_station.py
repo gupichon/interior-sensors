@@ -5,9 +5,9 @@ import neopixel
 
 # --- Imports optionnels par capteur ---
 try:
-    import adafruit_scd4x
+    import adafruit_ltr390
 except ImportError:
-    adafruit_scd4x = None
+    adafruit_ltr390 = None
 
 try:
     from adafruit_pm25.i2c import PM25_I2C
@@ -58,19 +58,14 @@ i2c = board.STEMMA_I2C()
 # TMP117 (T haute précision)
 tmp = adafruit_tmp117.TMP117(i2c)  # 0x48
 
-# SCD41 (CO2, T, RH)
-scd = None
-if adafruit_scd4x is not None:
+# LTR390 (UVS, UVi, light, lux)
+ltr = None
+if adafruit_ltr390 is not None:
     try:
-        scd = adafruit_scd4x.SCD4X(i2c)  # 0x62
-        print("SCD4x Serial:", [hex(i) for i in scd.serial_number])
-        try:
-            scd.start_periodic_measurement()  # mesure continue entre réveils
-        except Exception as ex:
-            print("SCD4x start:", ex)
+        ltr = adafruit_ltr390.LTR390(i2c)  # 0x53
     except Exception as ex2:
-        scd = None
-        print("SCD4x init:", ex2)
+        ltr = None
+        print("LTR390 init:", ex2)
 
 # PMSA003I (PM)
 pm25 = None
@@ -102,31 +97,10 @@ if adafruit_sgp30 is not None:
         print("SGP30 init:", ex)
 
 # ---------- Aides mesures ----------
-def read_scd_low_power(max_wait_s=6.0):
-    if scd is None:
+def read_ltr390():
+    if ltr is None:
         return {}
-    t0 = time.monotonic()
-    while not scd.data_ready and (time.monotonic() - t0) < max_wait_s:
-        time.sleep(0.2)
-    out = {}
-    if scd.data_ready:
-        try:
-            if scd.CO2 is not None:
-                out["co2"] = int(scd.CO2)
-        except Exception:
-            pass
-        try:
-            if scd.relative_humidity is not None:
-                out["humidity_scd"] = r(scd.relative_humidity, 1)
-        except Exception:
-            pass
-        try:
-            if scd.temperature is not None:
-                out["temperature_scd"] = r(scd.temperature, 1)
-        except Exception:
-            pass
-    else:
-        print("SCD4x: no data")
+    out = {"uvi": ltr.uvi, "uvs": ltr.uvs, "light": ltr.light, "lux": ltr.lux}
     return out
 
 def read_pm25():
@@ -189,17 +163,13 @@ def _set_sgp30_humidity_compensation():
     except Exception:
         temp = None
 
-    # 2. Humidité depuis SCD41 en priorité, sinon BME688
-    if scd is not None and getattr(scd, "relative_humidity", None) is not None:
-        rh = float(scd.relative_humidity)
-    elif bme is not None and getattr(bme, "humidity", None) is not None:
+    # 2. Humidité depuis BME688
+    if bme is not None and getattr(bme, "humidity", None) is not None:
         rh = float(bme.humidity)
 
     # 3. Si TMP117 absent, on peut prendre la température d’un autre capteur
     if temp is None:
-        if scd is not None and getattr(scd, "temperature", None) is not None:
-            temp = float(scd.temperature)
-        elif bme is not None and getattr(bme, "temperature", None) is not None:
+        if bme is not None and getattr(bme, "temperature", None) is not None:
             temp = float(bme.temperature)
 
     if temp is None or rh is None:
@@ -294,7 +264,7 @@ def publish_ha_discovery(cli, device_id, topic_state, topic_avail):
         "identifiers": [device_id],
         "name": DEVICE_NAME,
         "manufacturer": "DIY",
-        "model": "QT Py ESP32-S3 + TMP117 + SCD41 + PMSA003I + BME688 + SGP30",
+        "model": "QT Py ESP32-S3 + TMP117 + LTR390 + PMSA003I + BME688 + SGP30",
     }
 
     def pub_config(suffix, name, unit, dev_cla, value_tpl, state_class="measurement"):
@@ -309,15 +279,21 @@ def publish_ha_discovery(cli, device_id, topic_state, topic_avail):
             "avty_t": topic_avail,
             "stat_cla": state_class,
         }
+        if dev_cla is not None:
+            cfg["dev_cla"] = dev_cla
+        if unit is not None:
+            cfg["unit_of_meas"] = unit
         cli.publish(f"{HA_PREFIX}/sensor/{device_id}_{suffix}/config", json.dumps(cfg), retain=True)
 
     # Température principale (TMP117)
     pub_config("temp", "Température", "°C", "temperature", "{{ value_json.temperature }}")
 
-    # SCD41
-    pub_config("hum_scd", "Humidité (SCD41)", "%", "humidity", "{{ value_json.humidity_scd }}")
-    pub_config("co2", "CO₂ (SCD41)", "ppm", "carbon_dioxide", "{{ value_json.co2 }}")
-    pub_config("temp_scd", "Température (SCD41)", "°C", "temperature", "{{ value_json.temperature_scd }}")
+    # LTR390
+    pub_config("uvi", "UV index", None, None, "{{ value_json.uvi }}")
+    pub_config("uvs", "UVS", None, None, "{{ value_json.uvs }}")
+    pub_config("light", "Ambient light", None, None, "{{ value_json.light }}")
+    pub_config("lux", "Illuminance", "lx", "illuminance", "{{ value_json.lux }}")
+
 
     # BME688
     pub_config("temp_bme", "Température (BME688)", "°C", "temperature", "{{ value_json.temperature_bme }}")
@@ -348,6 +324,7 @@ def publish_ha_discovery(cli, device_id, topic_state, topic_avail):
         alarm.sleep_memory[0] = 0xA5
     except Exception:
         pass
+    print("Published")
 
 # ---------- Main ----------
 pixel = neopixel.NeoPixel(board.NEOPIXEL, 1)
@@ -375,8 +352,8 @@ try:
     except Exception as e:
         print("TMP117 err:", e)
 
-    # SCD41
-    payload.update(read_scd_low_power(max_wait_s=10))
+    # LTR390
+    payload.update(read_ltr390())
 
     # BME688
     payload.update(read_bme())
@@ -391,7 +368,7 @@ try:
 
     if any(k in payload for k in (
         "temperature",
-        "humidity_scd", "co2", "temperature_scd",
+        "uvi", "uvs", "light", "lux",
         "temperature_bme", "humidity_bme", "pressure_bme", "gas_resistance_bme",
         "pm1_0", "pm2_5", "pm10", "n0_3", "n0_5", "n1_0", "n2_5", "n5_0", "n10",
         "eco2_sgp", "tvoc",
